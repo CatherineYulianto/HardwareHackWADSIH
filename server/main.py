@@ -146,7 +146,7 @@ async def _prewarm_tts_cache():
     asyncio.get_running_loop().run_in_executor(None, _fill)
 
 
-def _speak(spoken: str, confidence: float = 1.0, category: Optional[str] = None,
+def _speak(spoken: str, confidence: float = 1.0,
            timer: Optional[timings.Timer] = None) -> Response:
     """Synthesize and return RAW PCM — 16 kHz, 16-bit signed little-endian,
     mono. No container, no compression: the glasses write these bytes
@@ -186,7 +186,6 @@ def _speak(spoken: str, confidence: float = 1.0, category: Optional[str] = None,
             "Content-Length": str(len(pcm_bytes)),
             "X-Spoken-Text": spoken,
             "X-Confidence": str(confidence),
-            "X-Category": str(category),
             "X-Sample-Rate": str(tts.SAMPLE_RATE),
             "X-Bits-Per-Sample": "16",
             "X-Channels": "1",
@@ -195,11 +194,14 @@ def _speak(spoken: str, confidence: float = 1.0, category: Optional[str] = None,
 
 
 def _speak_vision_result(result: dict, timer: Optional[timings.Timer] = None) -> Response:
-    if result["needs_reposition"] or result["confidence"] < CONFIDENCE_THRESHOLD:
+    # Only fall back to the reposition line when the model isn't confident.
+    # needs_reposition alone doesn't override a confident answer: the model
+    # often flags it while still reading the label correctly.
+    if result["confidence"] < CONFIDENCE_THRESHOLD or not result.get("spoken_summary"):
         spoken = REPOSITION_TEXT
     else:
         spoken = result["spoken_summary"]
-    return _speak(spoken, result["confidence"], result["category"], timer=timer)
+    return _speak(spoken, result["confidence"], timer=timer)
 
 
 @app.get("/health")
