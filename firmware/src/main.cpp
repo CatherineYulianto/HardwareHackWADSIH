@@ -63,6 +63,7 @@ void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);  // power saving throttles throughput to a few kB/s
   Serial.print("Connecting to WiFi");
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -90,6 +91,13 @@ void setupWiFi() {
 // HTTPS connection costs the ESP32 1-3 s of handshake; reusing it costs
 // nothing. keepServerWarm() pings /health while idle so the connection is
 // still open when the pad is pressed.
+// Touch diagnostics, reported in each keep-alive ping so they show up in the
+// Railway logs even on battery, with no serial monitor.
+extern float touchBaseline;
+uint32_t touchMaxSincePing = 0;
+volatile bool touchNearby = false;
+uint32_t pressCount = 0;
+
 WiFiClientSecure serverClient;
 // Created once and never destroyed. HTTPClient's destructor calls stop() on
 // its connection, so a local HTTPClient hung up at the end of every request
@@ -100,13 +108,19 @@ const unsigned long KEEPALIVE_MS = 20000;
 
 void keepServerWarm() {
   if (WiFi.status() != WL_CONNECTED) return;
+  // Never ping mid-touch: the request blocks this core, and a press during
+  // it is lost.
+  if (touchNearby) return;
   // Time-based on purpose: if the server is unreachable, retrying every loop
   // would block the pad for the whole timeout, over and over.
   if (lastServerContact != 0 && millis() - lastServerContact < KEEPALIVE_MS) return;
   HTTPClient &http = serverHttp;
   http.setReuse(true);
   http.setTimeout(8000);
-  http.begin(serverClient, String("https://") + SERVER_HOST + "/health");
+  http.begin(serverClient, String("https://") + SERVER_HOST + "/health?base=" +
+             String((uint32_t)touchBaseline) + "&max=" + String(touchMaxSincePing) +
+             "&presses=" + String(pressCount) + "&up=" + String(millis() / 1000));
+  touchMaxSincePing = 0;
   bool wasOpen = serverClient.connected();
   int code = http.GET();
   if (code > 0) http.getString();   // drain so the connection can be reused
@@ -164,6 +178,7 @@ bool ensureWiFi() {
   Serial.print("WiFi down — reconnecting");
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);
   for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
     delay(500);
     Serial.print(".");
@@ -246,6 +261,10 @@ bool setupCamera() {
 //     build changes.
 float touchBaseline = 0;
 
+// A press reads 2.5x the idle value. Idle value = touchBaseline, averaged at
+// boot and slowly tracked while untouched.
+#define TOUCH_FACTOR 2.5f
+
 // Averages the untouched reading at power-on (~0.5 s). Don't touch the pad
 // during it; if you do, the drift tracking in manualTriggered() recovers.
 void calibrateTouch() {
@@ -257,8 +276,8 @@ void calibrateTouch() {
     delay(20);
   }
   touchBaseline = (float)sum / n;
-  Serial.printf("[PAD] baseline %.0f, touch above %.0f (+%d%%)\n", touchBaseline,
-                touchBaseline * (100 + TOUCH_RISE_PERCENT) / 100.0f, TOUCH_RISE_PERCENT);
+  Serial.printf("[PAD] baseline %.0f, touch above %.0f (x%.2f)\n", touchBaseline,
+                touchBaseline * TOUCH_FACTOR, (double)TOUCH_FACTOR);
 #endif
 }
 
@@ -268,23 +287,13 @@ bool manualTriggered() {
   // HIGH and reads LOW while pressed. This wiring needs no resistor.
   return digitalRead(PIN_TRIGGER) == LOW;
 #else
-  // Polarity differs across the ESP32 family: on the original ESP32 the
-  // reading FALLS when touched, on the ESP32-S3 it RISES. Run the selftest
-  // build once — it prints the baseline, the touched range, and which of
-  // these two values to use. Guessing makes the pad fire constantly or never
-  // fire, and the wiring looks identical either way.
-  // Compared against the baseline measured at boot, not a fixed number:
-  // readings shift between USB and battery power. See calibrateTouch().
   uint32_t v = touchRead(PIN_TRIGGER);
-  float limit = touchBaseline * (100.0f + TOUCH_RISE_PERCENT) / 100.0f;
-  float limitLow = touchBaseline * (100.0f - TOUCH_RISE_PERCENT) / 100.0f;
-#if TOUCH_ACTIVE_HIGH
-  bool touched = v > limit;
-#else
-  bool touched = v < limitLow;
-#endif
-  // Follow slow drift (temperature, humidity, a touch held at power-on)
-  // while untouched, so the baseline corrects itself within a few seconds.
+  if (v > touchMaxSincePing) touchMaxSincePing = v;
+
+  bool touched = v > touchBaseline * TOUCH_FACTOR;
+  touchNearby = touched;
+
+  // Track slow drift in the idle value while untouched.
   if (!touched) touchBaseline = touchBaseline * 0.995f + v * 0.005f;
   return touched;
 #endif
@@ -544,6 +553,7 @@ void loop() {
 
   if (nowTriggered && !wasTriggered && millis() > ignoreUntil) {
     Serial.println("Triggered — capturing frame");
+    pressCount++;
     captureAskAndSpeak();
     ignoreUntil = millis() + 1500;
   }

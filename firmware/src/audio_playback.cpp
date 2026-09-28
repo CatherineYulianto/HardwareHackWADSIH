@@ -117,12 +117,10 @@ static void writeSamples(const int16_t *samples, size_t count) {
   }
 }
 
-// Plays while the reply is still arriving, instead of downloading all of it
-// first. A short pre-buffer absorbs hotspot jitter; after that each chunk is
-// played as soon as it's read, and i2s_write() blocking on a full DMA buffer
-// paces the reads. If the network falls behind, playback pauses briefly
-// rather than failing.
-static const int PREBUFFER_BYTES = 16000;   // 0.5 s at 16 kHz 16-bit mono
+// Downloads the WHOLE reply into PSRAM, then plays it from memory. Playing
+// while reading (the previous version) stuttered: over TLS on a phone
+// hotspot the link often can't sustain 32 KB/s, so the DMA ran dry mid-word
+// every time a read lagged. A 15 s reply is ~480 KB against 8 MB of PSRAM.
 
 // Reads up to `want` bytes, waiting for data. Returns bytes read; fewer than
 // asked means the connection ended or stalled.
@@ -157,39 +155,34 @@ void playPcmStream(WiFiClient *stream, int contentLength) {
     return;
   }
 
-  static uint8_t chunk[PREBUFFER_BYTES] __attribute__((aligned(4)));
-  int remaining = contentLength;
-
-  // Pre-buffer, then start the DAC.
-  int want = remaining < PREBUFFER_BYTES ? remaining : PREBUFFER_BYTES;
-  int got = readSome(stream, chunk, want);
-  if (got < 2) {
-    Serial.println("[SPK] no audio received");
+  uint8_t *buf = (uint8_t *)ps_malloc(contentLength);
+  if (!buf) {
+    Serial.printf("[SPK] no PSRAM for %d bytes\n", contentLength);
     return;
   }
-  remaining -= got;
-  Serial.printf("[SPK] streaming %d bytes (%.1fs)\n", contentLength,
-                (double)contentLength / (PCM_SAMPLE_RATE * 2));
 
-  i2s_start(I2S_NUM_1);
-  int carry = 0;   // a byte left over when a read ends mid-sample
-  while (true) {
-    int usable = (carry + got) & ~1;
-    writeSamples((const int16_t *)chunk, usable / 2);
-    carry = (carry + got) - usable;
-    if (carry) chunk[0] = chunk[usable];
-    if (remaining <= 0) break;
-
-    want = remaining < (PREBUFFER_BYTES - carry) ? remaining : (PREBUFFER_BYTES - carry);
-    if (want > 2048) want = 2048;    // small reads keep audio flowing
-    got = readSome(stream, chunk + carry, want);
-    if (got <= 0) {
-      Serial.printf("[SPK] stream ended early, %d bytes short\n", remaining);
-      break;
-    }
-    remaining -= got;
+  const unsigned long t0 = millis();
+  int got = readSome(stream, buf, contentLength);
+  Serial.printf("[SPK] downloaded %d/%d bytes in %lums (%.1fs of audio)\n",
+                got, contentLength, millis() - t0,
+                (double)got / (PCM_SAMPLE_RATE * 2));
+  if (got < 2) {
+    Serial.println("[SPK] no audio received");
+    free(buf);
+    return;
   }
+  if (got < contentLength) {
+    Serial.printf("[SPK] stream ended early, %d bytes short — playing what arrived\n",
+                  contentLength - got);
+  }
+
+  i2s_zero_dma_buffer(I2S_NUM_1);
+  i2s_start(I2S_NUM_1);
+  writeSamples((const int16_t *)buf, got / 2);
+  // Let the last DMA buffers drain before stopping, or the tail gets cut.
+  delay(150);
   i2s_zero_dma_buffer(I2S_NUM_1);
   i2s_stop(I2S_NUM_1);
+  free(buf);
   Serial.println("[SPK] playback finished");
 }
